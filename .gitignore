@@ -1,0 +1,19 @@
+# Environnements Python
+env/
+**/env/
+venv/
+.venv/
+
+# Fichiers Python temporaires
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Variables et secrets
+.env
+.env.*
+!.env.example
+
+# Bases de données
+*.db
+*.sqlite3
