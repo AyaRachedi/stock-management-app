@@ -64,20 +64,40 @@ class MouvementResponse(BaseModel):
 # 3. Schémas des commandes
 # -------------------------
 
+# -------------------------
+# 3. Schémas des commandes
+# -------------------------
+
+class ClientCommande(BaseModel):
+    nom: str
+    email: str
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class LigneCommande(BaseModel):
     sku: str
     quantite: int = Field(gt=0)
     prix_unitaire_ht: float = Field(ge=0)
-    montant_total_ht: float = Field(ge=0)
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class CommandeCreate(BaseModel):
     numero_commande: str
     date_commande: datetime
-    client: str
+    client: ClientCommande
     lignes: list[LigneCommande]
-    statut: str
+    montant_total_ht: float = Field(ge=0)
+    statut: Literal[
+        "en_attente",
+        "confirmee",
+        "expediee",
+        "facturee",
+        "annulee"
+    ]
 
+    model_config = ConfigDict(extra="ignore")
 
 # -------------------------
 # 4. Schéma des alertes

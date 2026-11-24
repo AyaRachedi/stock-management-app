@@ -1,15 +1,16 @@
+
 {
-  "slug": "agent-exemple",
-  "name": "Agent exemple",
+  "slug": "agent-stock",
+  "name": "Agent de gestion de stock",
   "version": "1.0.0",
-  "description": "Gabarit de reference, a utiliser comme point de depart pour developper votre propre agent.",
-  "filiere": "iot",
-  "category": "demonstration",
+  "description": "Agent de gestion des stocks, suivi des mouvements et détection des stocks faibles ou des ruptures.",
+  "filiere": "automatisation_metier",
+  "category": "gestion_stock",
   "developer": {
-    "name": "A completer",
-    "email": "a-completer@etu.ecole.fr"
+    "name": "StockPilot",
+    "email": "a_kherfi@estin.dz"
   },
-  "team_name": "A completer",
+  "team_name": "StockPilot team",
   "pricing_model": "flat_monthly",
   "price": 0,
   "resource_requirements": {
@@ -25,6 +26,11 @@
     "config_schema": "/config-schema",
     "exchange_notify": "/exchange/notify"
   },
-  "produces": [],
-  "consumes": []
+  "produces": [
+    "stock_level",
+    "mouvement_stock"
+  ],
+  "consumes": [
+    "commande"
+  ]
 }

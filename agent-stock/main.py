@@ -1,6 +1,7 @@
 
 import os
 import time
+import hmac
 import httpx
 
 from datetime import datetime, timezone
@@ -8,7 +9,19 @@ from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Depends,
+    Request
+)
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -38,24 +51,122 @@ from stock_service import (
 
 
 # ============================================================
-# INITIALISATION
+# 1. INITIALISATION
 # ============================================================
 
 app = FastAPI(title="Agent de gestion de stock")
 
 demarre_le = time.time()
 
-NOYAU_URL = os.getenv("NOYAU_URL", "http://localhost:8000")
+NOYAU_URL = os.getenv(
+    "NOYAU_URL",
+    "http://localhost:8000"
+).rstrip("/")
+
+# Mécanisme d'authentification Bearer pour FastAPI / Swagger.
+# Le bouton Authorize sera disponible dans Swagger.
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="BearerAuth"
+)
 
 
 # ============================================================
-# OUTILS DE SECURITE ET DE COMMUNICATION AVEC LE NOYAU
+# 2. FORMAT STANDARD DES REPONSES HTTP
 # ============================================================
+
+def reponse_ok(data=None):
+    return {
+        "status": "ok",
+        "data": jsonable_encoder(data),
+        "error": None
+    }
+
+
+@app.exception_handler(StarletteHTTPException)
+async def gestion_erreur_http(
+    request: Request,
+    exc: StarletteHTTPException
+):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "data": None,
+            "error": str(exc.detail)
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def gestion_erreur_validation(
+    request: Request,
+    exc: RequestValidationError
+):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "data": None,
+            "error": "Données invalides"
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def gestion_erreur_interne(
+    request: Request,
+    exc: Exception
+):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "data": None,
+            "error": "Erreur interne du serveur"
+        }
+    )
+
+
+# ============================================================
+# 3. SECURITE ET GESTION DES TENANTS
+# ============================================================
+
+def extraire_cle_bearer(
+    credentials: Optional[HTTPAuthorizationCredentials]
+) -> str:
+    """
+    Récupère et vérifie la présence de la clé Bearer.
+    """
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Clé API Bearer manquante"
+        )
+
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Authentification Bearer obligatoire"
+        )
+
+    cle_api = credentials.credentials.strip()
+
+    if not cle_api:
+        raise HTTPException(
+            status_code=401,
+            detail="Clé API Bearer vide"
+        )
+
+    return cle_api
+
 
 def obtenir_fernet():
     """
     Récupère la clé de chiffrement depuis le fichier .env.
     """
+
     cle = os.getenv("FERNET_KEY")
 
     if not cle:
@@ -66,6 +177,7 @@ def obtenir_fernet():
 
     try:
         return Fernet(cle.encode())
+
     except Exception:
         raise HTTPException(
             status_code=500,
@@ -84,6 +196,7 @@ def dechiffrer_cle_api(cle_chiffree: str) -> str:
         return obtenir_fernet().decrypt(
             cle_chiffree.encode()
         ).decode()
+
     except InvalidToken:
         raise HTTPException(
             status_code=500,
@@ -108,14 +221,73 @@ def obtenir_tenant(
     return tenant
 
 
-async def envoyer_alerte(
+def verifier_cle_api(
+    tenant: Tenant,
+    credentials: Optional[HTTPAuthorizationCredentials]
+):
+    """
+    Compare la clé Bearer reçue avec la clé enregistrée
+    pour le tenant.
+    """
+
+    cle_api_recue = extraire_cle_bearer(credentials)
+
+    if not tenant.tenant_api_key_chiffree:
+        raise HTTPException(
+            status_code=401,
+            detail="Aucune clé API enregistrée pour ce tenant"
+        )
+
+    cle_api_stockee = dechiffrer_cle_api(
+        tenant.tenant_api_key_chiffree
+    )
+
+    if not hmac.compare_digest(
+        cle_api_recue,
+        cle_api_stockee
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Clé API invalide"
+        )
+
+
+def obtenir_tenant_authentifie(
     db: Session,
+    tenant_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials]
+):
+    """
+    Vérifie que le tenant existe, est actif et possède
+    une clé API valide.
+    """
+
+    tenant = obtenir_tenant(
+        db,
+        tenant_id
+    )
+
+    verifier_cle_api(
+        tenant,
+        credentials
+    )
+
+    return tenant
+
+
+# ============================================================
+# 4. COMMUNICATION AVEC LE NOYAU
+# ============================================================
+
+async def envoyer_alerte(
     tenant: Tenant,
     alerte: dict
 ):
     """
     Envoie une alerte de stock au webhook du noyau.
+    Une indisponibilité du webhook ne bloque pas le mouvement.
     """
+
     if not tenant.tenant_api_key_chiffree:
         return
 
@@ -123,9 +295,10 @@ async def envoyer_alerte(
         tenant.tenant_api_key_chiffree
     )
 
-    async with httpx.AsyncClient(timeout=5) as client:
-        try:
-            reponse = await client.post(
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+
+            response = await client.post(
                 f"{NOYAU_URL}/webhooks/agent-events",
                 headers={
                     "Authorization": f"Bearer {cle_api}",
@@ -133,12 +306,13 @@ async def envoyer_alerte(
                 },
                 json=alerte
             )
-            reponse.raise_for_status()
 
-        except httpx.HTTPError:
-            # L'alerte reste consultable dans l'agent.
-            # Une erreur du noyau ne doit pas annuler le mouvement.
-            pass
+            response.raise_for_status()
+
+    except httpx.HTTPError:
+        # L'alerte reste consultable dans l'agent.
+        # Une erreur du webhook ne bloque pas le mouvement.
+        pass
 
 
 async def publier_sur_bus(
@@ -148,18 +322,23 @@ async def publier_sur_bus(
     payload: dict
 ):
     """
-    Publie un objet sur le bus d'échange du noyau.
+    Publie un objet métier sur le bus d'échange du noyau.
     """
+
     if not tenant.tenant_api_key_chiffree:
-        return
+        raise HTTPException(
+            status_code=401,
+            detail="Aucune clé API enregistrée pour ce tenant"
+        )
 
     cle_api = dechiffrer_cle_api(
         tenant.tenant_api_key_chiffree
     )
 
-    async with httpx.AsyncClient(timeout=5) as client:
-        try:
-            await client.post(
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+
+            response = await client.post(
                 f"{NOYAU_URL}/exchange/agent/{type_objet}",
                 headers={
                     "Authorization": f"Bearer {cle_api}",
@@ -170,30 +349,48 @@ async def publier_sur_bus(
                     "payload": payload
                 }
             )
-        except httpx.HTTPError:
-            # Le noyau pourra être indisponible temporairement.
-            pass
+
+            response.raise_for_status()
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Le noyau n'a pas répondu dans le délai prévu"
+        )
+
+    except httpx.HTTPStatusError as erreur:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Le noyau a refusé la publication de "
+                f"{type_objet} : HTTP {erreur.response.status_code}"
+            )
+        )
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=502,
+            detail="Impossible de contacter le noyau"
+        )
 
 
 # ============================================================
-# 1. ROUTES OBLIGATOIRES DU NOYAU
+# 5. ROUTES OBLIGATOIRES DU NOYAU
 # ============================================================
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "data": {
-            "uptime_seconds": int(time.time() - demarre_le)
-        },
-        "error": None
-    }
+    return reponse_ok({
+        "uptime_seconds": int(time.time() - demarre_le)
+    })
 
 
 @app.post("/tenant/activate")
 def activate(
     body: dict,
-    authorization: Optional[str] = Header(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
     x_tenant_id: Optional[str] = Header(
         None,
         alias="X-Tenant-Id"
@@ -206,13 +403,9 @@ def activate(
             detail="X-Tenant-Id manquant"
         )
 
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Clé API Bearer manquante"
-        )
-
-    cle_api = authorization.replace("Bearer ", "", 1)
+    # La clé fournie par le noyau est enregistrée
+    # pour les futurs échanges avec ce tenant.
+    cle_api = extraire_cle_bearer(credentials)
 
     config = body.get("config", {})
 
@@ -222,16 +415,21 @@ def activate(
 
     try:
         if tenant is None:
+
             tenant = Tenant(
                 tenant_id=x_tenant_id,
                 state="running",
                 config=config,
                 tenant_api_key_chiffree=chiffrer_cle_api(cle_api)
             )
+
             db.add(tenant)
+
         else:
+
             tenant.state = "running"
             tenant.config = config
+
             tenant.tenant_api_key_chiffree = chiffrer_cle_api(
                 cle_api
             )
@@ -242,15 +440,16 @@ def activate(
         db.rollback()
         raise
 
-    return {
-        "status": "ok",
-        "data": {"activated": True},
-        "error": None
-    }
+    return reponse_ok({
+        "activated": True
+    })
 
 
 @app.post("/tenant/deactivate")
 def deactivate(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
     x_tenant_id: Optional[str] = Header(
         None,
         alias="X-Tenant-Id"
@@ -267,86 +466,109 @@ def deactivate(
         Tenant.tenant_id == x_tenant_id
     ).first()
 
-    if tenant is not None:
+    # Exiger une clé même si le tenant n'existe déjà plus.
+    if tenant is None:
+        extraire_cle_bearer(credentials)
+
+    else:
+        verifier_cle_api(
+            tenant,
+            credentials
+        )
+
         try:
-            # Les produits, mouvements et commandes traitées
-            # sont supprimés grâce aux relations ON DELETE CASCADE.
+            # Les données associées doivent être supprimées
+            # grâce aux contraintes de suppression configurées
+            # dans les modèles et dans PostgreSQL.
             db.delete(tenant)
             db.commit()
+
         except Exception:
             db.rollback()
             raise
 
-    return {
-        "status": "ok",
-        "data": {
-            "deactivated": True,
-            "data_purged": True
-        },
-        "error": None
-    }
+    return reponse_ok({
+        "deactivated": True,
+        "data_purged": True
+    })
 
 
 @app.get("/tenant/{tenant_id}/status")
 def tenant_status(
     tenant_id: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    tenant = db.query(Tenant).filter(
-        Tenant.tenant_id == tenant_id
-    ).first()
-
-    if tenant is None or tenant.state != "running":
+    if tenant_id != x_tenant_id:
         raise HTTPException(
-            status_code=404,
-            detail="Tenant non actif"
+            status_code=403,
+            detail="Le tenant indiqué ne correspond pas au tenant authentifié"
         )
 
-    return {
-        "status": "ok",
-        "data": {
-            "state": tenant.state
-        },
-        "error": None
-    }
+    tenant = obtenir_tenant_authentifie(
+        db,
+        tenant_id,
+        credentials
+    )
+
+    return reponse_ok({
+        "state": tenant.state
+    })
 
 
 @app.get("/config-schema")
 def config_schema():
-    return {
-        "status": "ok",
-        "data": {
-            "type": "object",
-            "properties": {
-                "seuil_alerte": {
-                    "type": "integer",
-                    "description": "Seuil de stock déclenchant une alerte",
-                    "default": 5
-                }
+    return reponse_ok({
+        "type": "object",
+        "properties": {
+            "seuil_alerte": {
+                "type": "integer",
+                "description": "Seuil de stock déclenchant une alerte",
+                "default": 5
             }
-        },
-        "error": None
-    }
+        }
+    })
 
 
 # ============================================================
-# 2. CRUD DES PRODUITS
+# 6. CRUD DES PRODUITS
 # ============================================================
 
-@app.post("/produits", response_model=ProduitResponse)
+@app.post("/produits")
 def creer_produit(
     produit_data: ProduitCreate,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     try:
-        return ajouter_produit(
+        produit = ajouter_produit(
             db,
             x_tenant_id,
             produit_data
         )
+
+        return reponse_ok(
+            ProduitResponse.model_validate(produit)
+        )
+
     except ValueError as erreur:
         raise HTTPException(
             status_code=409,
@@ -354,25 +576,59 @@ def creer_produit(
         )
 
 
-@app.get("/produits", response_model=list[ProduitResponse])
+@app.get("/produits")
 def lire_produits(
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
-    return lister_produits(db, x_tenant_id)
+    produits = lister_produits(
+        db,
+        x_tenant_id
+    )
+
+    produits_reponse = [
+        ProduitResponse.model_validate(produit)
+        for produit in produits
+    ]
+
+    return reponse_ok(produits_reponse)
 
 
-@app.get("/produits/{sku}/stock", response_model=StockResponse)
+@app.get("/produits/{sku}/stock")
 def consulter_stock(
     sku: str,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
-    produit = obtenir_produit(db, x_tenant_id, sku)
+    produit = obtenir_produit(
+        db,
+        x_tenant_id,
+        sku
+    )
 
     if produit is None:
         raise HTTPException(
@@ -380,18 +636,34 @@ def consulter_stock(
             detail="Produit introuvable"
         )
 
-    return produit
+    return reponse_ok(
+        StockResponse.model_validate(produit)
+    )
 
 
-@app.get("/produits/{sku}", response_model=ProduitResponse)
+@app.get("/produits/{sku}")
 def lire_produit(
     sku: str,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
-    produit = obtenir_produit(db, x_tenant_id, sku)
+    produit = obtenir_produit(
+        db,
+        x_tenant_id,
+        sku
+    )
 
     if produit is None:
         raise HTTPException(
@@ -399,25 +671,42 @@ def lire_produit(
             detail="Produit introuvable"
         )
 
-    return produit
+    return reponse_ok(
+        ProduitResponse.model_validate(produit)
+    )
 
 
-@app.put("/produits/{sku}", response_model=ProduitResponse)
+@app.put("/produits/{sku}")
 def mettre_a_jour_produit(
     sku: str,
     modifications: ProduitUpdate,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     try:
-        return modifier_produit(
+        produit = modifier_produit(
             db,
             x_tenant_id,
             sku,
             modifications
         )
+
+        return reponse_ok(
+            ProduitResponse.model_validate(produit)
+        )
+
     except ValueError as erreur:
         raise HTTPException(
             status_code=404,
@@ -428,17 +717,32 @@ def mettre_a_jour_produit(
 @app.delete("/produits/{sku}")
 def effacer_produit(
     sku: str,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     try:
-        supprimer_produit(db, x_tenant_id, sku)
-        return {
-            "status": "ok",
+        supprimer_produit(
+            db,
+            x_tenant_id,
+            sku
+        )
+
+        return reponse_ok({
             "message": "Produit supprimé"
-        }
+        })
+
     except ValueError as erreur:
         raise HTTPException(
             status_code=404,
@@ -447,16 +751,26 @@ def effacer_produit(
 
 
 # ============================================================
-# 3. GESTION DES MOUVEMENTS DE STOCK
+# 7. GESTION DES MOUVEMENTS DE STOCK
 # ============================================================
 
-@app.post("/mouvements", response_model=MouvementResponse)
+@app.post("/mouvements")
 async def creer_mouvement(
     mouvement_data: MouvementCreate,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    tenant = obtenir_tenant(db, x_tenant_id)
+    tenant = obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     produit = obtenir_produit(
         db,
@@ -472,13 +786,19 @@ async def creer_mouvement(
 
     quantite = mouvement_data.quantite
 
-    if mouvement_data.type_mouvement in ("entree", "sortie") and quantite <= 0:
+    if (
+        mouvement_data.type_mouvement in ("entree", "sortie")
+        and quantite <= 0
+    ):
         raise HTTPException(
             status_code=400,
             detail="La quantité doit être positive pour une entrée ou une sortie"
         )
 
-    if mouvement_data.type_mouvement == "ajustement" and quantite == 0:
+    if (
+        mouvement_data.type_mouvement == "ajustement"
+        and quantite == 0
+    ):
         raise HTTPException(
             status_code=400,
             detail="La quantité d'ajustement ne peut pas être nulle"
@@ -509,14 +829,17 @@ async def creer_mouvement(
 
     try:
         produit.quantite_disponible = nouvelle_quantite
+
         produit.alerte_niveau = determiner_niveau_stock(
             nouvelle_quantite,
             produit.seuil_alerte
         )
+
         produit.updated_at = datetime.now(timezone.utc)
 
         db.add(mouvement)
         db.commit()
+
         db.refresh(mouvement)
         db.refresh(produit)
 
@@ -556,18 +879,33 @@ async def creer_mouvement(
     alerte = preparer_alerte(produit)
 
     if alerte:
-        await envoyer_alerte(db, tenant, alerte)
+        await envoyer_alerte(
+            tenant,
+            alerte
+        )
 
-    return mouvement
+    return reponse_ok(
+        MouvementResponse.model_validate(mouvement)
+    )
 
 
-@app.get("/mouvements", response_model=list[MouvementResponse])
+@app.get("/mouvements")
 def lire_mouvements(
     sku: Optional[str] = None,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     requete = db.query(MouvementStock).filter(
         MouvementStock.tenant_id == x_tenant_id
@@ -578,21 +916,38 @@ def lire_mouvements(
             MouvementStock.sku == sku
         )
 
-    return requete.order_by(
+    mouvements = requete.order_by(
         MouvementStock.date_mouvement.desc()
     ).all()
 
+    mouvements_reponse = [
+        MouvementResponse.model_validate(mouvement)
+        for mouvement in mouvements
+    ]
+
+    return reponse_ok(mouvements_reponse)
+
 
 # ============================================================
-# 4. CONSULTATION DES ALERTES
+# 8. CONSULTATION DES ALERTES
 # ============================================================
 
-@app.get("/alertes", response_model=list[AlerteResponse])
+@app.get("/alertes")
 def lire_alertes(
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    obtenir_tenant(db, x_tenant_id)
+    obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
 
     produits = db.query(Produit).filter(
         Produit.tenant_id == x_tenant_id,
@@ -605,42 +960,80 @@ def lire_alertes(
         alerte = preparer_alerte(produit)
 
         if alerte:
-            alertes.append(alerte)
+            alertes.append(
+                AlerteResponse.model_validate(alerte)
+            )
 
-    return alertes
+    return reponse_ok(alertes)
 
 
 # ============================================================
-# 5. RECEPTION DES COMMANDES DE L'AGENT COMMERCIAL
+# 9. RECEPTION DES COMMANDES DE L'AGENT COMMERCIAL
 # ============================================================
 
 @app.post("/exchange/notify")
 async def exchange_notify(
     body: dict,
-    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
     db: Session = Depends(get_db)
 ):
-    tenant = obtenir_tenant(db, x_tenant_id)
+    # ========================================================
+    # 1. Vérification de l'authentification
+    # ========================================================
+
+    tenant = obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
+
+    # ========================================================
+    # 2. Vérification du type d'objet reçu
+    # ========================================================
 
     if body.get("object_type") != "commande":
-        return {
-            "status": "ok",
-            "data": {
-                "processed": False,
-                "reason": "Type d'objet ignoré"
-            },
-            "error": None
-        }
+        return reponse_ok({
+            "processed": False,
+            "reason": "Type d'objet ignoré"
+        })
+
+    # ========================================================
+    # 3. Validation de la commande
+    # ========================================================
 
     try:
         commande = CommandeCreate.model_validate(
             body.get("payload", {})
         )
-    except Exception as erreur:
+
+    except Exception:
         raise HTTPException(
             status_code=422,
-            detail=f"Commande invalide : {erreur}"
+            detail="Commande invalide"
         )
+
+    # Vérifier la cohérence de l'identifiant externe,
+    # lorsqu'il est fourni par le noyau.
+    external_id = body.get("external_id")
+
+    if (
+        external_id is not None
+        and external_id != commande.numero_commande
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="L'identifiant externe ne correspond pas au numéro de commande"
+        )
+
+    # ========================================================
+    # 4. Vérification des commandes déjà traitées
+    # ========================================================
 
     deja_traitee = db.query(CommandeTraitee).filter(
         CommandeTraitee.tenant_id == x_tenant_id,
@@ -648,20 +1041,22 @@ async def exchange_notify(
     ).first()
 
     if deja_traitee:
-        return {
-            "status": "ok",
-            "data": {
-                "processed": True,
-                "duplicate": True
-            },
-            "error": None
-        }
+        return reponse_ok({
+            "processed": True,
+            "duplicate": True
+        })
+
+    # ========================================================
+    # 5. Vérification des produits et des quantités
+    # ========================================================
 
     try:
-        # Vérifier toutes les lignes avant de modifier les stocks.
         produits_commande = []
+        mouvements_crees = []
 
+        # Vérifier toutes les lignes avant de modifier les stocks.
         for ligne in commande.lignes:
+
             produit = obtenir_produit(
                 db,
                 x_tenant_id,
@@ -680,19 +1075,29 @@ async def exchange_notify(
                     detail=f"Stock insuffisant pour {ligne.sku}"
                 )
 
-            produits_commande.append((produit, ligne))
+            produits_commande.append(
+                (produit, ligne)
+            )
 
-        # Enregistrer les sorties de stock.
+        # ====================================================
+        # 6. Mise à jour du stock et création des mouvements
+        # ====================================================
+
         for produit, ligne in produits_commande:
+
+            # Diminuer la quantité disponible.
             produit.quantite_disponible -= ligne.quantite
 
+            # Recalculer le niveau du stock.
             produit.alerte_niveau = determiner_niveau_stock(
                 produit.quantite_disponible,
                 produit.seuil_alerte
             )
 
+            # Mettre à jour la date de modification.
             produit.updated_at = datetime.now(timezone.utc)
 
+            # Créer un mouvement de sortie.
             mouvement = MouvementStock(
                 tenant_id=x_tenant_id,
                 sku=produit.sku,
@@ -703,7 +1108,12 @@ async def exchange_notify(
 
             db.add(mouvement)
 
-        # Marquer la commande comme traitée.
+            mouvements_crees.append(mouvement)
+
+        # ====================================================
+        # 7. Enregistrer la commande comme traitée
+        # ====================================================
+
         db.add(
             CommandeTraitee(
                 tenant_id=x_tenant_id,
@@ -719,6 +1129,7 @@ async def exchange_notify(
 
     except IntegrityError:
         db.rollback()
+
         raise HTTPException(
             status_code=409,
             detail="Cette commande a déjà été traitée"
@@ -728,12 +1139,38 @@ async def exchange_notify(
         db.rollback()
         raise
 
-    # Envoyer les alertes et publier les niveaux actualisés.
+    # ========================================================
+    # 8. Publier les mouvements de stock au noyau
+    # ========================================================
+
+    for mouvement in mouvements_crees:
+
+        await publier_sur_bus(
+            tenant,
+            "mouvement_stock",
+            str(mouvement.id_mouvement),
+            {
+                "id_mouvement": str(mouvement.id_mouvement),
+                "sku": mouvement.sku,
+                "type_mouvement": mouvement.type_mouvement,
+                "quantite": mouvement.quantite,
+                "reference_commande": mouvement.reference_commande
+            }
+        )
+
+    # ========================================================
+    # 9. Envoyer les alertes et publier les niveaux de stock
+    # ========================================================
+
     for produit, ligne in produits_commande:
+
         alerte = preparer_alerte(produit)
 
         if alerte:
-            await envoyer_alerte(db, tenant, alerte)
+            await envoyer_alerte(
+                tenant,
+                alerte
+            )
 
         await publier_sur_bus(
             tenant,
@@ -748,11 +1185,11 @@ async def exchange_notify(
             }
         )
 
-    return {
-        "status": "ok",
-        "data": {
-            "processed": True,
-            "numero_commande": commande.numero_commande
-        },
-        "error": None
-    }
+    # ========================================================
+    # 10. Réponse finale au noyau
+    # ========================================================
+
+    return reponse_ok({
+        "processed": True,
+        "numero_commande": commande.numero_commande
+    })

@@ -1,0 +1,106 @@
+CREATE TYPE Etablissement_Type AS OBJECT (
+    code NUMBER,
+    nom VARCHAR2(50),
+    type VARCHAR2(30)
+);
+crreate table Etablissement of etablissement_type(
+    cpnstaint pk primary key(code)
+);
+
+/ 
+CREATE TYPE Chercheur_Type AS OBJECT (
+    code NUMBER,
+    nom VARCHAR2(50),
+    prenom VARCHAR2(50),
+    grade VARCHAR2(50),
+    affiliation REF Etablissement_Type
+);
+/
+create table cherheur of chercheru-type(
+    constaint pk-cher primary ely(code),
+    constaint c1 check(affiliation is not null),
+    constarint ref-aff references etablissement
+);
+
+CREATE TYPE cherhceur_elt_nt_Type(
+    ref-cher ref chercher-typr
+);
+create type chercheru_nt_type as tzble of chercheru_elt_nt_type;
+
+CREATE TYPE Projet_Type AS OBJECT (
+    code VARCHAR2(30),
+    intitule VARCHAR2(100),
+    duree NUMBER,
+    domaine VARCHAR2(50),
+    filiere VARCHAR2(50),
+    ref_etablissement REF Etablissement_Type,
+    respsable REF Chercheur_Type,
+    membre chercheru_nt_type);
+/
+create table projet pf projet(
+    constaint pk-projt primary ley(code),
+    cnstaint c2 check(filliere is not null),
+    cnstaint c3 check(responsable is not null),
+    constaint c4 filiere references etablissement,
+    constaint c5 respinsable  references chercherus,
+)
+nested table cherhcer-elet-nt-type store as tab-chercher-facultatif
+CREATE TABLE Etablissements OF Etablissement_Type (
+    PRIMARY KEY (code),
+    nom NOT NULL,
+    type NOT NULL
+);
+/
+CREATE TABLE Chercheurs OF Chercheur_Type (
+    PRIMARY KEY (code),
+    nom NOT NULL,
+    prenom NOT NULL,
+    grade NOT NULL,
+    affiliation NOT NULL,
+    SCOPE FOR (affiliation) IS Etablissements
+);
+/
+CREATE TABLE Projets OF Projet_Type (
+    PRIMARY KEY (code),
+    intitule NOT NULL,
+    duree NOT NULL CHECK (duree > 0),
+    domaine NOT NULL,
+    filiere NOT NULL,
+    etablissement_financeur NOT NULL,
+    chef_projet NOT NULL,
+    SCOPE FOR (etablissement_financeur)
+        IS Etablissements,
+    SCOPE FOR (chef_projet)
+        IS Chercheurs
+)
+NESTED TABLE chercheurs STORE AS Projet_Chercheurs;
+/
+
+insertionn:
+insert into etablisemetn values (etablisemetn-type("16","etablisement1", "t1"));
+insert into projet value(
+    '02/SDRF/2026', 'ai', 36, "infor",'aids',(seelect ref(e ) from etabliseemt e where e.coeetab=1),
+    (select ref(c) from chercheru whrer c.codechercher ='ca')
+    checheur table(chercheru-nt-typz(selecg ref(c1) from cgerchzur c1 where c1.code=2),
+    chercher-nt-type-(selct ref(c2 from chercher c2 whre c2.code='5')))
+
+),
+
+
+4) select m.ref-cherhcer.nom,m.ref-cherhcer.^prenom from ¨Projet p ,table(p.membre) 
+m whrer p.code="02/SDRF/2026" ;
+
+5/
+select p.ref-etabelisement.code, p.ref-etablisement.nom from 
+peojet p group by p.ref-etablisement.ceode ,p.ref-etablisselem.nom
+having count(*)=(select max (count(*)) from projt p group by p.ref-etablisement.ceode
+ , p.ref-etablisement.nom);
+ asruce1:
+having cond sur fct having 
+where cond pas de fct prrsice  
+
+
+astuce2:
+
+where group by 
+group by having 
