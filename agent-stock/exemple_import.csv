@@ -1,0 +1,4 @@
+sku;designation;quantite_disponible;seuil_alerte;entrepot
+P001;Clavier;20;5;Principal
+P002;Souris;15;3;Principal
+P003;Ecran;10;2;Depot

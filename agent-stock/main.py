@@ -14,8 +14,11 @@ from fastapi import (
     Header,
     HTTPException,
     Depends,
-    Request
+    Request,
+    UploadFile,
+    File
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -25,7 +28,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from database import get_db
+from database import get_db, engine, Base
 from models import Tenant, Produit, MouvementStock, CommandeTraitee
 
 from schemas import (
@@ -46,7 +49,9 @@ from stock_service import (
     lister_produits,
     obtenir_produit,
     modifier_produit,
-    supprimer_produit
+    supprimer_produit,
+    lire_csv_stock,
+    importer_stock_csv
 )
 
 
@@ -56,7 +61,32 @@ from stock_service import (
 
 app = FastAPI(title="Agent de gestion de stock")
 
+# CORS : autorise le front (React) à appeler l'API depuis le navigateur.
+# Les origines se règlent avec la variable CORS_ORIGINS (séparées par
+# des virgules). Par défaut : Vite (5173) et Create React App (3000).
+ORIGINES_AUTORISEES = [
+    origine.strip()
+    for origine in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:3000"
+    ).split(",")
+    if origine.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ORIGINES_AUTORISEES,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "X-Tenant-Id", "Content-Type"],
+)
+
 demarre_le = time.time()
+
+
+@app.on_event("startup")
+def creer_tables():
+    """Crée les tables si elles n'existent pas (base vide, premier lancement)."""
+    Base.metadata.create_all(bind=engine)
 
 NOYAU_URL = os.getenv(
     "NOYAU_URL",
@@ -320,16 +350,17 @@ async def publier_sur_bus(
     type_objet: str,
     external_id: str,
     payload: dict
-):
+) -> bool:
     """
     Publie un objet métier sur le bus d'échange du noyau.
+
+    Renvoie True si le noyau a accepté l'objet, False sinon.
+    Les données sont déjà enregistrées en base à ce stade : une
+    indisponibilité du noyau ne doit pas faire échouer l'opération.
     """
 
     if not tenant.tenant_api_key_chiffree:
-        raise HTTPException(
-            status_code=401,
-            detail="Aucune clé API enregistrée pour ce tenant"
-        )
+        return False
 
     cle_api = dechiffrer_cle_api(
         tenant.tenant_api_key_chiffree
@@ -351,27 +382,10 @@ async def publier_sur_bus(
             )
 
             response.raise_for_status()
+            return True
 
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Le noyau n'a pas répondu dans le délai prévu"
-        )
-
-    except httpx.HTTPStatusError as erreur:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Le noyau a refusé la publication de "
-                f"{type_objet} : HTTP {erreur.response.status_code}"
-            )
-        )
-
-    except httpx.RequestError:
-        raise HTTPException(
-            status_code=502,
-            detail="Impossible de contacter le noyau"
-        )
+    except httpx.HTTPError:
+        return False
 
 
 # ============================================================
@@ -526,13 +540,9 @@ def tenant_status(
 def config_schema():
     return reponse_ok({
         "type": "object",
-        "properties": {
-            "seuil_alerte": {
-                "type": "integer",
-                "description": "Seuil de stock déclenchant une alerte",
-                "default": 5
-            }
-        }
+        # Aucun réglage à l'activation : le seuil d'alerte se définit
+        # produit par produit (défaut 5 si non précisé).
+        "properties": {}
     })
 
 
@@ -712,6 +722,103 @@ def mettre_a_jour_produit(
             status_code=404,
             detail=str(erreur)
         )
+
+
+# IMPORT CSV : import d'inventaire par fichier
+@app.post("/produits/import-csv")
+async def importer_produits_csv(
+    fichier: UploadFile = File(...),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        bearer_scheme
+    ),
+    x_tenant_id: str = Header(
+        ...,
+        alias="X-Tenant-Id"
+    ),
+    db: Session = Depends(get_db)
+):
+    tenant = obtenir_tenant_authentifie(
+        db,
+        x_tenant_id,
+        credentials
+    )
+
+    contenu = await fichier.read()
+
+    # 1. Lire et vérifier le fichier
+    try:
+        lignes, erreurs = lire_csv_stock(contenu)
+
+    except ValueError as erreur:
+        raise HTTPException(
+            status_code=400,
+            detail=str(erreur)
+        )
+
+    if erreurs:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "data": {
+                    "erreurs": erreurs
+                },
+                "error": (
+                    f"{len(erreurs)} erreur(s) dans le fichier : "
+                    "rien n'a été importé"
+                )
+            }
+        )
+
+    # 2. Enregistrer en base (tout ou rien)
+    resume, changements = importer_stock_csv(
+        db,
+        x_tenant_id,
+        lignes
+    )
+
+    # 3. Prévenir le noyau et envoyer les alertes
+    for produit, mouvement in changements:
+
+        if mouvement is not None:
+            await publier_sur_bus(
+                tenant,
+                "mouvement_stock",
+                str(mouvement.id_mouvement),
+                {
+                    "id_mouvement": str(mouvement.id_mouvement),
+                    "sku": mouvement.sku,
+                    "type_mouvement": mouvement.type_mouvement,
+                    "quantite": mouvement.quantite,
+                    "reference_commande": mouvement.reference_commande
+                }
+            )
+
+        await publier_sur_bus(
+            tenant,
+            "stock_level",
+            produit.sku,
+            {
+                "sku": produit.sku,
+                "designation": produit.designation,
+                "quantite_disponible": produit.quantite_disponible,
+                "seuil_alerte": produit.seuil_alerte,
+                "entrepot": produit.entrepot
+            }
+        )
+
+        alerte = preparer_alerte(produit)
+
+        if alerte:
+            await envoyer_alerte(
+                tenant,
+                alerte
+            )
+
+    return reponse_ok({
+        "lignes": len(lignes),
+        **resume
+    })
 
 
 @app.delete("/produits/{sku}")
@@ -1032,6 +1139,130 @@ async def exchange_notify(
         )
 
     # ========================================================
+    # Annulation d'une commande
+    # ========================================================
+    # Si la commande avait été confirmée (stock sorti), on remet le
+    # stock une seule fois. Sinon il n'y a rien à rendre : on ignore.
+
+    if commande.statut == "annulee":
+
+        traitee = db.query(CommandeTraitee).filter(
+            CommandeTraitee.tenant_id == x_tenant_id,
+            CommandeTraitee.numero_commande == commande.numero_commande
+        ).first()
+
+        if not traitee:
+            return reponse_ok({
+                "processed": False,
+                "reason": "Commande annulée sans stock sorti, ignorée"
+            })
+
+        deja_remis = db.query(MouvementStock).filter(
+            MouvementStock.tenant_id == x_tenant_id,
+            MouvementStock.reference_commande == commande.numero_commande,
+            MouvementStock.type_mouvement == "entree"
+        ).first()
+
+        if deja_remis:
+            return reponse_ok({
+                "processed": True,
+                "duplicate": True
+            })
+
+        # Quantités réellement sorties pour cette commande, par produit.
+        sorties = db.query(MouvementStock).filter(
+            MouvementStock.tenant_id == x_tenant_id,
+            MouvementStock.reference_commande == commande.numero_commande,
+            MouvementStock.type_mouvement == "sortie"
+        ).all()
+
+        a_remettre = {}
+        for sortie in sorties:
+            a_remettre[sortie.sku] = (
+                a_remettre.get(sortie.sku, 0) + sortie.quantite
+            )
+
+        produits_remis = []
+        mouvements_remis = []
+
+        try:
+            for sku, quantite in a_remettre.items():
+
+                produit = obtenir_produit(db, x_tenant_id, sku)
+
+                # Produit supprimé depuis : rien à remettre.
+                if produit is None:
+                    continue
+
+                produit.quantite_disponible += quantite
+                produit.alerte_niveau = determiner_niveau_stock(
+                    produit.quantite_disponible,
+                    produit.seuil_alerte
+                )
+                produit.updated_at = datetime.now(timezone.utc)
+
+                mouvement = MouvementStock(
+                    tenant_id=x_tenant_id,
+                    sku=sku,
+                    type_mouvement="entree",
+                    quantite=quantite,
+                    reference_commande=commande.numero_commande
+                )
+
+                db.add(mouvement)
+                produits_remis.append(produit)
+                mouvements_remis.append(mouvement)
+
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            raise
+
+        for mouvement in mouvements_remis:
+            await publier_sur_bus(
+                tenant,
+                "mouvement_stock",
+                str(mouvement.id_mouvement),
+                {
+                    "id_mouvement": str(mouvement.id_mouvement),
+                    "sku": mouvement.sku,
+                    "type_mouvement": mouvement.type_mouvement,
+                    "quantite": mouvement.quantite,
+                    "reference_commande": mouvement.reference_commande
+                }
+            )
+
+        for produit in produits_remis:
+            await publier_sur_bus(
+                tenant,
+                "stock_level",
+                produit.sku,
+                {
+                    "sku": produit.sku,
+                    "designation": produit.designation,
+                    "quantite_disponible": produit.quantite_disponible,
+                    "seuil_alerte": produit.seuil_alerte,
+                    "entrepot": produit.entrepot
+                }
+            )
+
+        return reponse_ok({
+            "processed": True,
+            "restocked": True,
+            "numero_commande": commande.numero_commande
+        })
+
+    # Seules les commandes confirmées font sortir du stock.
+    # La commande n'est pas marquée comme traitée : si elle est
+    # confirmée plus tard, elle sera traitée à ce moment-là.
+    if commande.statut != "confirmee":
+        return reponse_ok({
+            "processed": False,
+            "reason": "Commande non confirmée, ignorée"
+        })
+
+    # ========================================================
     # 4. Vérification des commandes déjà traitées
     # ========================================================
 
@@ -1123,8 +1354,23 @@ async def exchange_notify(
 
         db.commit()
 
-    except HTTPException:
+    except HTTPException as erreur:
         db.rollback()
+
+        # Commande impossible à honorer : on prévient l'entreprise.
+        if erreur.status_code in (400, 404):
+            await envoyer_alerte(
+                tenant,
+                {
+                    "event_type": "commande_non_traitee",
+                    "severity": "high",
+                    "data": {
+                        "numero_commande": commande.numero_commande,
+                        "raison": erreur.detail
+                    }
+                }
+            )
+
         raise
 
     except IntegrityError:
